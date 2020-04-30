@@ -1,0 +1,539 @@
+---
+title: "Amusement Park Injuries"
+author: "Andrew Farina"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document: 
+    code_folding: hide
+---
+
+## Overview
+
+```{r setup, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+
+library(kableExtra)
+
+library(tidyverse)
+library(scales)
+library(stringr)
+library(lubridate)
+library(patchwork)
+
+library(tidytext)
+library(wordcloud)
+library(ggraph)
+library(igraph)
+
+ggplot2::theme_set(theme_light())
+
+# Function to add colored text to the document
+
+colorize <- function(x, color) {
+  if (knitr::is_latex_output()) {
+    sprintf("\\textcolor{%s}{%s}", color, x)
+  } else if (knitr::is_html_output()) {
+    sprintf("<span style='color: %s;'>%s</span>", color, 
+      x)
+  } else x
+}
+
+# Function for visualizing Bi-grams
+
+visualize_bigrams <- function(bigrams) {
+  set.seed(2020)
+  a <- grid::arrow(type = "closed", length = unit(.15, "inches"))
+  
+  bigrams %>%
+    graph_from_data_frame() %>%
+    ggraph(layout = "fr") +
+    geom_node_point(color = "lightblue", size = 3) +
+    geom_edge_link(aes(edge_alpha = n), show.legend = FALSE, arrow = a) +
+    geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+    theme_void()
+}
+```
+
+```{r pressure, echo=FALSE, fig.cap="#tidytuesday image", fig.align = "center", out.width = '50%', echo = FALSE}
+knitr::include_graphics(here::here("img", "tidy_tuesday.png"))
+```
+
+These data are from the [#TidyTuesday](https://github.com/rfordatascience/tidytuesday) (10 Sept 2019) project. Tidy Tuesday is a weekly data project aimed at the R ecosystem. As this project was borne out of the R4DS Online Learning Community and the R for Data Science textbook, an emphasis was placed on understanding how to summarize and arrange data to make meaningful charts with `{ggplot2}`, `{tidyr}`, `{dplyr}`, and other tools in the `{tidyverse}` ecosystem. 
+
+The intent of Tidy Tuesday is to provide a safe and supportive forum for individuals to practice their wrangling and data visualization skills independent of drawing conclusions. While we understand that the two are related, the focus of this practice is purely on building skills with real-world data.
+
+## Amusement Park Injuries 
+
+This particular dataset is from the [SaferParks Database](https://saferparksdata.org/downloads).
+
+These data contain a lot free text, some inconsistent NAs (n/a, N/A) and dates (ymd, dmy). A good chance to do some data cleaning and then take a look at frequency, incident types, injury types, and accident types using free text analysis.
+
+```{r pulling in these data, include = FALSE}
+safer_parks <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2019/2019-09-10/saferparks.csv")
+glimpse(safer_parks)
+```
+
+The safer_parks dataset contains `r nrow(safer_parks)` incidents that were recorded from `r n_distinct(safer_parks$bus_type)` different types of parks. Below is a table containing the number on incidents according to the type of parks.
+
+```{r Incidents by business type}
+safer_parks %>% 
+  count(`Park Type` = bus_type, sort = TRUE, name = "Number of Incidents") %>% 
+  kable() %>% kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% 
+  scroll_box(height = "400px") 
+```
+<br>
+For this analysis, I will focus on the amusement park industry. The first thing I did was filter these data to only include incidents from either an *Amusement park* or *Carnival or rental* when the industry sector was listed as *amusement ride*. 
+
+```{r data filtering}
+dat <- safer_parks %>% 
+  filter(bus_type %in% c("Amusement park", "Carnival or rental") &
+                              industry_sector == "amusement ride") %>% 
+  mutate(acc_date = mdy(acc_date), 
+         month = factor(month(acc_date, label = TRUE, abbr = TRUE)),
+         manufacturer = ifelse(is.na(manufacturer), "Unknown", manufacturer),
+         category2 = ifelse(str_detect(category, ":"),
+                             str_extract(category, "^([^:])+"), category),
+         category2 = ifelse(str_detect(category, "Illness"),
+                             "Illness", category2))
+```
+
+The resulting dataset contains `r nrow(dat)` incidents that we will analyze further.
+
+### Type of Incident
+
+First, we will look at the ten most common types of incidents that occur with respect to amusement rides:
+
+```{r type of injury}
+dat %>% 
+  count(category2) %>% 
+  mutate(category2 = fct_reorder(category2, n)) %>% 
+  top_n(n=10) %>%
+  ggplot(aes(category2, n, fill = category2)) + 
+  geom_col(show.legend = FALSE) + 
+  coord_flip() + 
+  scale_fill_grey(start = 0.8, end = 0.3) +
+  labs(x = NULL, 
+       y = "Number of Incidents",
+       title = "Ten Most Common Types of Incidents",
+       subtitle = "Reported for amusement rides")
+```
+
+#### Incidents According to State
+
+Second, we will look at the most common states where incidents occur. Below is a table that contains the number of incidents according to state.
+
+```{r incident by state}
+dat %>% 
+  count(State = acc_state, name = "Number of Incidents", sort = TRUE) %>% 
+  kable() %>% kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% 
+  scroll_box(height = "300px")
+```
+<br>
+Although interesting, this may be misleading given the population differences between these states. For example, Pennsylvania is substantially smaller in population than California, yet it has almost 1/2 of the number of incidents. To better understand these data, we will pull in state population data from the 2010 decennial US Census using the `{tidycensus}` package and match state names with the built in state abbreviations.
+
+```{r state population data}
+st_crosswalk <- tibble(state = state.name) %>%
+  bind_cols(tibble(abb = state.abb))
+
+state_pop <- as_tibble(tidycensus::get_decennial(geography = "state", 
+                           variables = "P001001") %>% select(state = NAME, pop = value)) %>% 
+  left_join(st_crosswalk, by = "state") %>% select(state = abb, pop)
+
+state_dat <- left_join(dat%>% count(acc_state), state_pop, by = c("acc_state" = "state"))
+
+state_dat %>% 
+  mutate(incident_per_100k = ((n / pop)*100000),
+         acc_state = fct_reorder(acc_state, incident_per_100k)) %>% 
+  top_n(n=10) %>%
+  ggplot(aes(acc_state, incident_per_100k, fill = acc_state)) + 
+  geom_col(show.legend = FALSE) + 
+  coord_flip() + 
+  scale_fill_grey(start = 0.8, end = 0.3) +
+  labs(x = "State", 
+       y = "Number of Incidents per 100k",
+       title = "Ten states with highest per-capita incidents",
+       subtitle = "Reported for amusement rides")
+```
+
+#### Incidents According to Date
+
+Next, we can look at when the incidents tend to cluster. We would expect incidents to occur around the summer time as it is the most likely time that people tend to go to amusement parks.
+
+```{r timeline}
+p1 <- dat %>%  
+  count(acc_date) %>% 
+  ggplot(aes(acc_date, n)) +
+  geom_line(color = "red") +
+  scale_x_date(date_breaks = "years" , date_labels = "%Y") +
+  labs(x = "Date of incident",
+       y = "Number of incidents",
+       title = "Seasonality of incidents")
+
+p2 <- dat %>%  
+  count(month) %>% 
+  ggplot(aes(month, n)) +
+  geom_col() +
+  labs(x = NULL,
+       y = "Number of incidents",
+       title = "Month when incidents occur")
+
+(p1 / p2)
+```
+<br>
+We do in fact see that incidents tend to occur more often during the summer months (June-August).
+
+#### Incidents by type of ride
+
+We can also look at the number of incidents according to the type of amusement ride to see if one type of ride has a higher number of incidents. Keep in mind, we are not controlling for the amount of a particular type that is at an amusement park. That is, we see that coasters have a high number of incidents, however, how common are coasters at an amusement park compared to vertical drops? We need to be careful when interpreting these data beyond using it for data exploration. 
+
+```{r injury by device category}
+dat %>% 
+  count(`Ride type` = device_category, name = "Number of Incidents", sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) 
+```
+
+#### Incidents by manufacturer
+
+Next we will look at the number of incidents by manufacturer. 
+```{r Manufacturer}
+dat %>% 
+  count(manufacturer, sort = TRUE) %>% 
+  mutate(manufacturer = fct_reorder(manufacturer, n)) %>% 
+  top_n(n = 10) %>% 
+  ggplot(aes(manufacturer, n, fill = manufacturer)) + 
+  geom_col(show.legend = FALSE)+ 
+  coord_flip() +
+  scale_fill_grey(start = 0.8, end = 0.3) + 
+  labs(x = "Manufacturer",
+       y = "Number of incidents",
+       title = "Ten manufacturers with the highest reported incidents")
+```
+
+It appears that *in-house* made amusement rides have the highest reported number of incidents followed by *Intamin AG*.
+
+Within these data, a column also lists if an incident was related to a mechanical issue, let's look at the manufacturers with the highest reported mechanical issues.
+
+```{r Mechanical}
+dat %>%  
+  filter(mechanical == 1) %>% 
+  count(manufacturer) %>% 
+  mutate(manufacturer = fct_reorder(manufacturer, n)) %>% 
+  top_n(n = 10) %>% 
+  ggplot(aes(manufacturer, n, fill = manufacturer)) + 
+  geom_col(show.legend = FALSE) + 
+  coord_flip() + 
+  scale_fill_grey(start = 0.8, end = 0.3) + 
+  labs(x = "Manufacturer",
+       y = "Number of mechanical incidents",
+       title = "Ten manufacturers with the highest reported mechanical incidents")
+```
+
+### Injury Text Analysis 
+
+Now for the fun part, several columns of these data have free text. We will look at two in particular. One describes the injury itself, and one describes the accident and how it occurred. 
+
+#### Text Analysis Overview
+
+
+For text analysis, we will use the `{tidytext}` package. First, we need to isolate the injury text and *tokenize* it. That is, we will split each row so that one token (word) is in each row. Additionally, punctuation is removed and words are converted to lowercase. I have also removed numbers that exist in the text (e.g. number of stitches).
+
+```{r injury tokenization}
+injury_tokens <- dat %>% 
+  select(acc_id, injury_desc) %>% 
+  unnest_tokens(word, injury_desc) %>% 
+  filter(is.na(as.numeric(word)))
+```
+
+Next, we will remove *stop words*, or words that are extremely common such as "the", "of", "to", etc. I have also removed the words *injury* and *pain* as they are not descriptive for our purposes and appear to be commonly used in the injury description.
+
+```{r injury stop words}
+data(stop_words) 
+my_stop_words <- c("injury", "pain")
+
+injury_tokens <- injury_tokens %>% anti_join(stop_words) %>% filter(!word %in% my_stop_words)
+```
+
+##### Bar-plot
+
+`r colorize("Q: What types of injuries occur most often?", "red")`
+
+We can use three visualizations to understand this a little easier. The first is a bar-plot showing the 20 most commonly used words when describing the injury.
+
+```{r injury bar plot}
+injury_tokens %>% count(word, sort = TRUE) %>% 
+  mutate(word = fct_reorder(word, n)) %>% 
+  slice(1:20) %>% 
+  ggplot(aes(x = word, y = n, fill = word)) + 
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_grey(start = 0.8, end = 0.3) + 
+  labs(x = "", y = "Number of Incidents",
+       title = "Twenty most common reported words in injury description")
+```
+
+##### Word-cloud
+The second is a word-cloud showing the frequency that words appear in the injury description column.
+
+```{r injury wordcloud}
+injury_tokens %>% count(word) %>% with(wordcloud(word, n, max.words = 100, colors =  c( "#56B4E9", "#E69F00")))
+```
+
+##### Bi-gram graph
+
+The third type of visualization is the relationships between words (n-grams). We are looking at how often words co-occur in these data.
+
+```{r injury bigrams}
+injury_bigrams <- dat %>%  
+  unnest_tokens(bigram, injury_desc, token = "ngrams", n = 2)
+  
+injury_bigrams_sep <- injury_bigrams %>% 
+  separate(bigram, c("word1", "word2"), sep = " ")
+
+injury_bigrams_filtered <- injury_bigrams_sep %>% 
+  filter(!word1 %in% c(stop_words$word, my_stop_words),
+         !word2 %in% c(stop_words$word, my_stop_words),
+         !is.na(word1),
+         is.na(as.numeric(word1)),
+         is.na(as.numeric(word2)))
+
+injury_bigrams_filtered %>% 
+  unite(bigram, word1, word2, sep = " ") %>% 
+  count(bigram, name = "Number of Incidents", sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% 
+  scroll_box(height = "400px")
+```
+<br>
+We can also visually look at how these words relate (cluster) together through the use of a bi-gram graph using the `{igraph}` and `{ggraph}` packages.
+
+```{r injury bigram graph, fig.align = "center", out.width = '75%'}
+injury_bigrams_filtered %>% 
+  count(word1, word2, sort = TRUE) %>% 
+  filter(n > 5)  %>% 
+  visualize_bigrams()
+```
+<br>
+We see how these words tend to cluster together. If we had a specific research question, we could dig deeper into these.
+
+#### Types of Injury by Manufacturer
+
+`r colorize("Q: What injuries are most often associated with what manufacturers?", "red")`
+
+We can organize these data to look at the most common injuries reported by manufacturer as well.
+
+```{r bigram injury and manufacturer}
+injury_bigrams_unite <- injury_bigrams_filtered %>% 
+  unite(bigram, word1, word2, sep = " ")
+
+manuf_of_interest <- injury_bigrams_unite %>% 
+  count(manufacturer, sort = TRUE) %>% 
+  filter(manufacturer != "Unknown") %>% 
+  slice(1:5)
+
+injury_bigrams_unite %>% 
+  filter(manufacturer %in% manuf_of_interest$manufacturer) %>% 
+  count(manufacturer, bigram, sort = TRUE) %>% 
+  arrange(manufacturer, desc(n)) %>% 
+  group_by(manufacturer) %>% 
+  slice(1:5) %>%
+  ungroup() %>% 
+  mutate(manufacturer = as.factor(manufacturer),
+         bigram = reorder_within(bigram, n, manufacturer)) %>% 
+  ggplot(aes(bigram, n, order = -n, fill = manufacturer)) + 
+  geom_col(show.legend = FALSE) +
+  scale_x_reordered() +
+  labs(x = NULL, y = "Number of Incidents", 
+       title = "Most common injuries reported by manufacturer",
+       subtitle = "Analyzing manufacturers with five most reported incidents") +   facet_wrap(~manufacturer, ncol = 2, scales = "free") + 
+  coord_flip() 
+```
+
+#### Types of Incidents by Ride Category
+`r colorize("Q: Are certain types of rides more dangerous?", "red")`
+
+We can look at the meta groupings (`r nrow(dat %>% count(device_category))` groups in these data). The figure below shows the number of incidents according to the amusement ride category.
+
+```{r}
+dat %>% 
+  count(device_category) %>% 
+  mutate(device_category = fct_reorder(device_category, n)) %>% 
+  ggplot(aes(device_category, n, fill = device_category)) + 
+  geom_col(show.legend = FALSE) + 
+  coord_flip() + 
+  scale_fill_grey(start = 0.8, end = 0.3) + 
+  labs(x = NULL, y = "Number of Incidents",
+       title = "Number of reported incidents by amusement ride category")
+```
+
+Clearly, there are more incidents that involve *Coaster* rides. We could also expand the device categories to see what device types are creating the most number of incidents.
+
+#### Types of Injury by Ride Type
+
+We can look at the more granular ride types (`r nrow(dat %>% count(device_type))` types in these data). The table below shows the number of incidents according to the ride type.  
+
+```{r injuries by device category}
+dat %>% 
+  count(`Ride Type` = device_type, name = "Number of Injuries", sort = TRUE) %>% 
+  kable() %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% 
+  scroll_box (height = "400px")
+```
+
+```{r injuries by device type}
+dat %>% 
+  count(device_category, device_type, sort = TRUE) %>% 
+  arrange(device_category, desc(n)) %>% 
+  group_by(device_category) %>% 
+  slice(1:5) %>% 
+  ungroup() %>% 
+  mutate(device_category = as.factor(device_category),
+         device_type = reorder_within(device_type, n, device_category)) %>% 
+  ggplot(aes(device_type, n, order = -n, fill = device_category)) + 
+  geom_col(show.legend = FALSE) + 
+  scale_x_reordered() +
+  labs(x = NULL, y = "Number of incidents",
+       title = "Most common incidents according to ride type",
+       subtitle = "Categorized by ride category") + 
+  facet_wrap(~device_category, ncol = 2, scales = "free") + 
+  coord_flip()
+```
+
+#### Types of Injury by Ride Category.
+
+Finally, we can look at the most common injuries according to ride category. 
+
+```{r injury bigram by device_category}
+injury_bigrams_unite %>% 
+  count(device_category, bigram, sort = TRUE) %>% 
+  arrange(device_category, desc(n)) %>% 
+  group_by(device_category) %>% 
+  slice(1:6) %>%
+  ungroup() %>% 
+  mutate(device_category = as.factor(device_category),
+         bigram = reorder_within(bigram, n, device_category)) %>% 
+  ggplot(aes(bigram, n, order = -n, fill = device_category)) + 
+  geom_col(show.legend = FALSE) +
+  scale_x_reordered() +
+  labs(x = NULL, y = "Number of incidents", 
+       title = "Most common injuries reported by ride category",
+       subtitle = "Analyzing device categories with six most reported bi-grams") + 
+  facet_wrap(~device_category, ncol = 2, scales = "free") + 
+  coord_flip() 
+```
+
+These make sense, it is interesting to see that the majority of the injuries occur on the left side of individuals. This could be due to the reporting practices (in fact, no 'right' side injuries were reported at all) or due to some other commonality of rides (perhaps they all swing in the same direction).
+
+### Accident Text Analysis
+
+`r colorize("Q: What types of accidents occur most frequently?", "red")`
+
+We will use the same text analysis process that we used previously to see if we can find patterns in the accident descriptions according to incident.
+
+```{r acc tokenization}
+acc_tokens <- dat %>% 
+  select(acc_id, acc_desc) %>% 
+  unnest_tokens(word, acc_desc) %>% 
+  filter(is.na(as.numeric(word)))
+
+data(stop_words) 
+my_stop_words <- c("patron", "ride", "stated", "riding", "pain", "attraction")
+
+acc_tokens <- acc_tokens %>% anti_join(stop_words) %>% filter(!word %in% my_stop_words)
+```
+
+##### Bar-plot
+
+First, we will look at the common words used when reporting accidents in these data.
+```{r acc barplot}
+acc_tokens %>% count(word, sort = TRUE) %>% 
+  mutate(word = fct_reorder(word, n)) %>% 
+  slice(1:20) %>% 
+  ggplot(aes(x = word, y = n, fill = word)) + 
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_grey(start = 0.8, end = 0.3) + 
+  labs(x = "", y = "Number of incidents",
+       title = "Twenty most common reported words in the accident description")
+```
+
+##### Word-cloud
+
+Second, we will use a word-cloud to create an alternate visual
+```{r acc wordcloud}
+acc_tokens %>% count(word) %>% with(wordcloud(word, n, max.words = 100, colors =  c( "#56B4E9", "#E69F00")))
+```
+<br>
+Falling seems to be a contributing factor to many of these incidents.
+
+##### Bi-gram graph
+
+Finally, we will use bi-grams to understand how accidents are described.
+
+```{r acc bigram}
+acc_bigrams <- dat %>%  
+  unnest_tokens(bigram, acc_desc, token = "ngrams", n = 2)
+  
+acc_bigrams_sep <- acc_bigrams %>% 
+  separate(bigram, c("word1", "word2"), sep = " ")
+
+acc_bigrams_filtered <- acc_bigrams_sep %>% 
+  filter(!word1 %in% c(stop_words$word, my_stop_words),
+         !word2 %in% c(stop_words$word, my_stop_words),
+         !is.na(word1),
+         is.na(as.numeric(word1)),
+         is.na(as.numeric(word2)))
+
+acc_bigrams_filtered %>% 
+  unite(bigram, word1, word2, sep = " ") %>% 
+  count(bigram, name = "number_of_incidents", sort = TRUE) %>% 
+  kable() %>% 
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>% 
+  scroll_box(height = "400px")
+```
+
+```{r acc bigram graph, fig.align = "center", out.width = '75%'}
+acc_bigrams_filtered %>% 
+  count(word1, word2, sort = TRUE) %>% 
+  filter(n > 5)  %>% 
+  visualize_bigrams()
+```
+
+We can again see that words tend to cluster together. If we had a specific research question, we could dig deeper into these.
+
+#### Accident Description by Ride Category.
+
+The last exploratory analysis we will do is to look at the associations between common bi-grams in the accident descriptions and the ride groups.
+
+```{r acc by device_category}
+acc_bigrams_unite <- acc_bigrams_filtered %>% 
+  unite(bigram, word1, word2, sep = " ")
+
+manuf_of_interest <- acc_bigrams_unite %>% 
+  count(manufacturer, sort = TRUE) %>% 
+  filter(manufacturer != "Unknown") %>% 
+  slice(1:5)
+
+acc_bigrams_unite %>% 
+  count(device_category, bigram, sort = TRUE) %>% 
+  arrange(device_category, desc(n)) %>% 
+  group_by(device_category) %>% 
+  slice(1:6) %>%
+  ungroup() %>% 
+  mutate(device_category = as.factor(device_category),
+         bigram = reorder_within(bigram, n, device_category)) %>% 
+  ggplot(aes(bigram, n, order = -n, fill = device_category)) + 
+  geom_col(show.legend = FALSE) +
+  scale_x_reordered() +
+  labs(x = NULL, y = "Number of Incidents", 
+       title = "Most common accidents reported by device types",
+       subtitle = "Analyzing ride categories with six most reported incidents") + 
+  facet_wrap(~device_category, ncol = 2, scales = "free") + 
+  coord_flip() 
+```
+
+It appears that the lap bar tends to be the biggest cause of accidents among all of the ride categories (except *Other Attraction*).
+
+We now have a broader understanding about the [SaferParks Database](https://saferparksdata.org/downloads). If we were working with a particular company or amusement park, we could conduct further analysis into the common accidents and injuries associated with manufacturer, ride type, and ride category.
